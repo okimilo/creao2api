@@ -3,21 +3,31 @@ from fastapi.responses import StreamingResponse
 import httpx
 import json
 import os
-from dotenv import load_dotenv
 import asyncio
 
-load_dotenv()
+app = FastAPI(title="CREAO Web2API - Railway 版")
 
-app = FastAPI(title="CREAO Web2API - 完整上下文版")
-
+# ==================== 从 Railway 环境变量读取 ====================
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 COOKIE = os.getenv("COOKIE")
+
 if not BEARER_TOKEN or not COOKIE:
-    raise Exception("请在 .env 中填写 BEARER_TOKEN 和 COOKIE")
+    raise Exception("缺少环境变量：请在 Railway 设置 BEARER_TOKEN 和 COOKIE")
 
 BASE_URL = "https://agent.creao.ai/api/agent/run"
 
-HEADERS = { ... }  # 保持你之前的那一整段 HEADERS 不变
+HEADERS = {
+    "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
+    "authorization": f"Bearer {BEARER_TOKEN}",
+    "content-type": "application/json",
+    "origin": "https://agent.creao.ai",
+    "referer": "https://agent.creao.ai/chat",
+    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+    "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+}
 
 client = httpx.AsyncClient(timeout=180.0, follow_redirects=True)
 
@@ -28,40 +38,35 @@ async def chat_completions(request: Request):
     stream = openai_data.get("stream", True)
     model = openai_data.get("model", "google/gemini-3.1-pro-preview")
 
-    # ==================== 暴力拼接完整上下文 ====================
+    # 暴力拼接完整上下文（角色设定 + 全部历史记录）
     prompt = ""
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if not content:
             continue
-            
         if role == "system":
             prompt += f"[System Details/设定信息]:\n{content}\n\n"
         elif role == "user":
             prompt += f"User: {content}\n\n"
         elif role == "assistant":
             prompt += f"Assistant: {content}\n\n"
-    
-    # 最后引导模型继续以 Assistant 身份回复
     prompt += "Assistant: "
-    
+
     if not prompt.strip():
         raise HTTPException(400, "No valid content found in messages")
-    # ============================================================
 
     payload = {
         "prompt": prompt,
         "mode": "copilot",
         "chatModelId": model,
         "skillIds": [],
-        "displayContent": prompt[:200]  # displayContent 只给前端预览用，截短一点
+        "displayContent": prompt[:200]
     }
 
     async def generate():
         async with client.stream("POST", BASE_URL, json=payload, headers=HEADERS, cookies=COOKIE) as resp:
             if resp.status_code != 200:
-                error_text = await resp.aread()
                 yield f'data: {{"error": "CREAO 返回 {resp.status_code}"}}\n\n'
                 yield "data: [DONE]\n\n"
                 return
@@ -72,9 +77,7 @@ async def chat_completions(request: Request):
                     continue
                 try:
                     data = json.loads(line)
-                    msg_type = data.get("type")
-
-                    if msg_type == "text_delta":
+                    if data.get("type") == "text_delta":
                         content = data.get("content", "")
                         if content:
                             chunk = {
@@ -85,8 +88,7 @@ async def chat_completions(request: Request):
                                 "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
                             }
                             yield f"data: {json.dumps(chunk)}\n\n"
-
-                    elif msg_type == "done":
+                    elif data.get("type") == "done":
                         final_chunk = {
                             "id": "chatcmpl-creao",
                             "object": "chat.completion.chunk",
