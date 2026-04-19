@@ -4,30 +4,30 @@ import httpx
 import json
 import os
 import asyncio
+from collections import deque
 
-app = FastAPI(title="CREAO Web2API - Railway 版")
+app = FastAPI(title="CREAO Web2API - 多账户轮询版")
 
-# ==================== 从 Railway 环境变量读取 ====================
-BEARER_TOKEN = os.getenv("BEARER_TOKEN")
-COOKIE = os.getenv("COOKIE")
+# ==================== 多账户配置（从 Railway 环境变量读取） ====================
+ACCOUNTS_JSON = os.getenv("ACCOUNTS")
+if not ACCOUNTS_JSON:
+    raise Exception("缺少环境变量 ACCOUNTS，请在 Railway 设置")
 
-if not BEARER_TOKEN or not COOKIE:
-    raise Exception("缺少环境变量：请在 Railway 设置 BEARER_TOKEN 和 COOKIE")
+# 解析成列表，每个元素是一个 dict: {"bearer": "...", "cookie": "..."}
+try:
+    ACCOUNTS = json.loads(ACCOUNTS_JSON)
+except:
+    raise Exception("ACCOUNTS 格式错误，必须是合法 JSON 数组")
+
+if not isinstance(ACCOUNTS, list) or len(ACCOUNTS) == 0:
+    raise Exception("ACCOUNTS 至少需要 1 个账号")
+
+print(f"✅ 已加载 {len(ACCOUNTS)} 个 CREAO 账号")
+
+# 轮询队列（线程安全）
+account_queue = deque(ACCOUNTS)
 
 BASE_URL = "https://agent.creao.ai/api/agent/run"
-
-HEADERS = {
-    "accept": "*/*",
-    "accept-language": "en-US,en;q=0.9",
-    "authorization": f"Bearer {BEARER_TOKEN}",
-    "content-type": "application/json",
-    "origin": "https://agent.creao.ai",
-    "referer": "https://agent.creao.ai/chat",
-    "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"macOS"',
-}
 
 client = httpx.AsyncClient(timeout=180.0, follow_redirects=True)
 
@@ -38,7 +38,29 @@ async def chat_completions(request: Request):
     stream = openai_data.get("stream", True)
     model = openai_data.get("model", "google/gemini-3.1-pro-preview")
 
-    # 暴力拼接完整上下文（角色设定 + 全部历史记录）
+    # ==================== 轮询取出当前账号 ====================
+    account = account_queue.popleft()          # 取出队首
+    account_queue.append(account)              # 放回队尾，实现轮询
+    # ============================================================
+
+    BEARER_TOKEN = account["bearer"]
+    COOKIE = account["cookie"]
+
+    # 动态 Headers
+    HEADERS = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "authorization": f"Bearer {BEARER_TOKEN}",
+        "content-type": "application/json",
+        "origin": "https://agent.creao.ai",
+        "referer": "https://agent.creao.ai/chat",
+        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+        "sec-ch-ua": '"Not)A;Brand";v="8", "Chromium";v="138", "Google Chrome";v="138"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+    }
+
+    # 暴力拼接完整上下文
     prompt = ""
     for msg in messages:
         role = msg.get("role", "user")
@@ -67,7 +89,8 @@ async def chat_completions(request: Request):
     async def generate():
         async with client.stream("POST", BASE_URL, json=payload, headers=HEADERS, cookies=COOKIE) as resp:
             if resp.status_code != 200:
-                yield f'data: {{"error": "CREAO 返回 {resp.status_code}"}}\n\n'
+                error_text = await resp.aread()
+                yield f'data: {{"error": "CREAO 返回 {resp.status_code} (账号可能已过期)"}}\n\n'
                 yield "data: [DONE]\n\n"
                 return
 
