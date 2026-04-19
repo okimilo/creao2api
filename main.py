@@ -1,36 +1,25 @@
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import json
 import os
 import asyncio
 from collections import deque
-import http.cookies  # 新增：用于解析 cookie 字符串
+import http.cookies
 
-app = FastAPI(title="CREAO Web2API - 多账户轮询版")
+app = FastAPI(title="CREAO Web2API - 完整内容纯转发版")
 
-# ==================== 多账户配置 ====================
 ACCOUNTS_JSON = os.getenv("ACCOUNTS")
 if not ACCOUNTS_JSON:
     raise Exception("缺少环境变量 ACCOUNTS")
-
-try:
-    ACCOUNTS = json.loads(ACCOUNTS_JSON)
-except:
-    raise Exception("ACCOUNTS 格式错误，必须是合法 JSON 数组")
-
-if not isinstance(ACCOUNTS, list) or len(ACCOUNTS) == 0:
-    raise Exception("ACCOUNTS 至少需要 1 个账号")
-
+ACCOUNTS = json.loads(ACCOUNTS_JSON)
 print(f"✅ 已加载 {len(ACCOUNTS)} 个 CREAO 账号")
 
 account_queue = deque(ACCOUNTS)
 
 BASE_URL = "https://agent.creao.ai/api/agent/run"
-
 client = httpx.AsyncClient(timeout=180.0, follow_redirects=True)
 
-# ==================== 新增：解析 cookie 字符串为 dict ====================
 def parse_cookies(cookie_str: str) -> dict:
     cookie = http.cookies.SimpleCookie()
     cookie.load(cookie_str)
@@ -43,13 +32,28 @@ async def chat_completions(request: Request):
     stream = openai_data.get("stream", True)
     model = openai_data.get("model", "google/gemini-3.1-pro-preview")
 
-    # 轮询取出当前账号
+    # 轮询账号
     account = account_queue.popleft()
     account_queue.append(account)
 
     BEARER_TOKEN = account["bearer"]
-    COOKIE_STR = account["cookie"]          # 原始字符串
-    COOKIES_DICT = parse_cookies(COOKIE_STR)  # 转成 dict
+    COOKIE_STR = account["cookie"]
+    COOKIES_DICT = parse_cookies(COOKIE_STR)
+
+    # ==================== 完整把 Chatbox 发来的 messages 转成一个大 prompt ====================
+    prompt = ""
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if content:
+            if role == "system":
+                prompt += f"[System]\n{content}\n\n"
+            elif role == "user":
+                prompt += f"[User]\n{content}\n\n"
+            elif role == "assistant":
+                prompt += f"[Assistant]\n{content}\n\n"
+    if not prompt.strip():
+        raise HTTPException(400, "No content found in messages")
 
     HEADERS = {
         "accept": "*/*",
@@ -64,40 +68,19 @@ async def chat_completions(request: Request):
         "sec-ch-ua-platform": '"macOS"',
     }
 
-    # 暴力拼接上下文
-    prompt = ""
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if not content:
-            continue
-        if role == "system":
-            prompt += f"[System Details/设定信息]:\n{content}\n\n"
-        elif role == "user":
-            prompt += f"User: {content}\n\n"
-        elif role == "assistant":
-            prompt += f"Assistant: {content}\n\n"
-    prompt += "Assistant: "
-
-    if not prompt.strip():
-        raise HTTPException(400, "No valid content found in messages")
-
     payload = {
-        "prompt": prompt,
+        "prompt": prompt,           # 完整内容
         "mode": "copilot",
         "chatModelId": model,
         "skillIds": [],
         "displayContent": prompt[:200]
     }
 
+    collected_content = ""
+
     async def generate():
-        async with client.stream(
-            "POST", 
-            BASE_URL, 
-            json=payload, 
-            headers=HEADERS, 
-            cookies=COOKIES_DICT   # ← 这里改成 dict
-        ) as resp:
+        nonlocal collected_content
+        async with client.stream("POST", BASE_URL, json=payload, headers=HEADERS, cookies=COOKIES_DICT) as resp:
             if resp.status_code != 200:
                 yield f'data: {{"error": "CREAO 返回 {resp.status_code}"}}\n\n'
                 yield "data: [DONE]\n\n"
@@ -112,24 +95,27 @@ async def chat_completions(request: Request):
                     if data.get("type") == "text_delta":
                         content = data.get("content", "")
                         if content:
-                            chunk = {
+                            collected_content += content
+                            if stream:
+                                chunk = {
+                                    "id": "chatcmpl-creao",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(asyncio.get_event_loop().time()),
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
+                                }
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                    elif data.get("type") == "done":
+                        if stream:
+                            final_chunk = {
                                 "id": "chatcmpl-creao",
                                 "object": "chat.completion.chunk",
                                 "created": int(asyncio.get_event_loop().time()),
                                 "model": model,
-                                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}]
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
                             }
-                            yield f"data: {json.dumps(chunk)}\n\n"
-                    elif data.get("type") == "done":
-                        final_chunk = {
-                            "id": "chatcmpl-creao",
-                            "object": "chat.completion.chunk",
-                            "created": int(asyncio.get_event_loop().time()),
-                            "model": model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-                        }
-                        yield f"data: {json.dumps(final_chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
+                            yield f"data: {json.dumps(final_chunk)}\n\n"
+                            yield "data: [DONE]\n\n"
                         break
                 except:
                     continue
@@ -137,7 +123,17 @@ async def chat_completions(request: Request):
     if stream:
         return StreamingResponse(generate(), media_type="text/event-stream")
     else:
-        raise HTTPException(400, "暂不支持非流式")
+        async for _ in generate():
+            pass
+        full_response = {
+            "id": "chatcmpl-creao",
+            "object": "chat.completion",
+            "created": int(asyncio.get_event_loop().time()),
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": collected_content}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        }
+        return JSONResponse(full_response)
 
 if __name__ == "__main__":
     import uvicorn
