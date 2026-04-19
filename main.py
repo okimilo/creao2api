@@ -5,15 +5,15 @@ import json
 import os
 import asyncio
 from collections import deque
+import http.cookies  # 新增：用于解析 cookie 字符串
 
 app = FastAPI(title="CREAO Web2API - 多账户轮询版")
 
-# ==================== 多账户配置（从 Railway 环境变量读取） ====================
+# ==================== 多账户配置 ====================
 ACCOUNTS_JSON = os.getenv("ACCOUNTS")
 if not ACCOUNTS_JSON:
-    raise Exception("缺少环境变量 ACCOUNTS，请在 Railway 设置")
+    raise Exception("缺少环境变量 ACCOUNTS")
 
-# 解析成列表，每个元素是一个 dict: {"bearer": "...", "cookie": "..."}
 try:
     ACCOUNTS = json.loads(ACCOUNTS_JSON)
 except:
@@ -24,12 +24,17 @@ if not isinstance(ACCOUNTS, list) or len(ACCOUNTS) == 0:
 
 print(f"✅ 已加载 {len(ACCOUNTS)} 个 CREAO 账号")
 
-# 轮询队列（线程安全）
 account_queue = deque(ACCOUNTS)
 
 BASE_URL = "https://agent.creao.ai/api/agent/run"
 
 client = httpx.AsyncClient(timeout=180.0, follow_redirects=True)
+
+# ==================== 新增：解析 cookie 字符串为 dict ====================
+def parse_cookies(cookie_str: str) -> dict:
+    cookie = http.cookies.SimpleCookie()
+    cookie.load(cookie_str)
+    return {k: v.value for k, v in cookie.items()}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
@@ -38,15 +43,14 @@ async def chat_completions(request: Request):
     stream = openai_data.get("stream", True)
     model = openai_data.get("model", "google/gemini-3.1-pro-preview")
 
-    # ==================== 轮询取出当前账号 ====================
-    account = account_queue.popleft()          # 取出队首
-    account_queue.append(account)              # 放回队尾，实现轮询
-    # ============================================================
+    # 轮询取出当前账号
+    account = account_queue.popleft()
+    account_queue.append(account)
 
     BEARER_TOKEN = account["bearer"]
-    COOKIE = account["cookie"]
+    COOKIE_STR = account["cookie"]          # 原始字符串
+    COOKIES_DICT = parse_cookies(COOKIE_STR)  # 转成 dict
 
-    # 动态 Headers
     HEADERS = {
         "accept": "*/*",
         "accept-language": "en-US,en;q=0.9",
@@ -60,7 +64,7 @@ async def chat_completions(request: Request):
         "sec-ch-ua-platform": '"macOS"',
     }
 
-    # 暴力拼接完整上下文
+    # 暴力拼接上下文
     prompt = ""
     for msg in messages:
         role = msg.get("role", "user")
@@ -87,10 +91,15 @@ async def chat_completions(request: Request):
     }
 
     async def generate():
-        async with client.stream("POST", BASE_URL, json=payload, headers=HEADERS, cookies=COOKIE) as resp:
+        async with client.stream(
+            "POST", 
+            BASE_URL, 
+            json=payload, 
+            headers=HEADERS, 
+            cookies=COOKIES_DICT   # ← 这里改成 dict
+        ) as resp:
             if resp.status_code != 200:
-                error_text = await resp.aread()
-                yield f'data: {{"error": "CREAO 返回 {resp.status_code} (账号可能已过期)"}}\n\n'
+                yield f'data: {{"error": "CREAO 返回 {resp.status_code}"}}\n\n'
                 yield "data: [DONE]\n\n"
                 return
 
